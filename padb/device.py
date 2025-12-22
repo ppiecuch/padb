@@ -1,0 +1,531 @@
+"""Device manager for ADB operations"""
+
+import os
+import re
+import subprocess
+import threading
+from typing import Callable, Optional
+from adbutils import AdbClient, AdbDevice
+
+from .wireless import state_manager
+
+
+class DeviceManager:
+    """Manages ADB device connections and operations."""
+
+    def __init__(self, host: str = "127.0.0.1", port: int = 5037):
+        self.client = AdbClient(host=host, port=port)
+        self.current_device: Optional[AdbDevice] = None
+        self._logcat_thread: Optional[threading.Thread] = None
+        self._logcat_running = False
+
+    def list_devices(self) -> list[AdbDevice]:
+        """List all connected ADB devices."""
+        try:
+            return self.client.device_list()
+        except Exception:
+            return []
+
+    def connect(self, device: AdbDevice) -> bool:
+        """Connect to a specific device."""
+        try:
+            self.current_device = device
+            return True
+        except Exception:
+            self.current_device = None
+            return False
+
+    def connect_by_serial(self, serial: str) -> bool:
+        """Connect to a device by its serial number."""
+        try:
+            device = self.client.device(serial)
+            self.current_device = device
+            return True
+        except Exception:
+            self.current_device = None
+            return False
+
+    def auto_connect(self) -> Optional[AdbDevice]:
+        """Auto-connect if only one device is available."""
+        devices = self.list_devices()
+        if len(devices) == 1:
+            self.connect(devices[0])
+            return self.current_device
+        return None
+
+    def get_device_info(self) -> dict:
+        """Get information about the current device."""
+        if not self.current_device:
+            return {}
+
+        try:
+            props = {}
+            props["serial"] = self.current_device.serial
+            props["model"] = self.current_device.prop.model or "Unknown"
+            props["brand"] = self.current_device.prop.get("ro.product.brand", "Unknown")
+            props["android_version"] = self.current_device.prop.get(
+                "ro.build.version.release", "Unknown"
+            )
+            return props
+        except Exception:
+            return {"serial": self.current_device.serial if self.current_device else "Unknown"}
+
+    def shell(self, command: str) -> str:
+        """Execute a shell command on the device."""
+        if not self.current_device:
+            return "Error: No device connected"
+        try:
+            return self.current_device.shell(command)
+        except Exception as e:
+            return f"Error: {e}"
+
+    def start_logcat(
+        self,
+        callback: Callable[[str], None],
+        clear: bool = True,
+    ) -> None:
+        """Start streaming logcat output."""
+        if not self.current_device:
+            return
+
+        self.stop_logcat()
+        self._logcat_running = True
+
+        def logcat_worker():
+            conn = None
+            try:
+                if clear:
+                    self.current_device.shell("logcat -c")
+
+                # Get streaming connection
+                conn = self.current_device.shell(
+                    "logcat -v threadtime",
+                    stream=True,
+                )
+
+                # Read from connection line by line
+                buffer = ""
+                while self._logcat_running:
+                    try:
+                        chunk = conn.recv(4096)
+                        if not chunk:
+                            break
+                        buffer += chunk.decode("utf-8", errors="replace")
+
+                        # Process complete lines
+                        while "\n" in buffer:
+                            line, buffer = buffer.split("\n", 1)
+                            if line:
+                                callback(line.rstrip("\r"))
+                    except Exception:
+                        break
+            except Exception:
+                pass
+            finally:
+                self._logcat_running = False
+                if conn:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+
+        self._logcat_thread = threading.Thread(target=logcat_worker, daemon=True)
+        self._logcat_thread.start()
+
+    def stop_logcat(self) -> None:
+        """Stop the logcat stream."""
+        self._logcat_running = False
+        if self._logcat_thread and self._logcat_thread.is_alive():
+            self._logcat_thread.join(timeout=1.0)
+        self._logcat_thread = None
+
+    def disconnect(self) -> None:
+        """Disconnect from the current device."""
+        self.stop_logcat()
+        self.current_device = None
+
+    def install(self, apk_path: str) -> str:
+        """Install an APK on the device."""
+        if not self.current_device:
+            return "Error: No device connected"
+
+        # Expand user home directory
+        apk_path = os.path.expanduser(apk_path)
+
+        if not os.path.exists(apk_path):
+            return f"Error: File not found: {apk_path}"
+        if not apk_path.lower().endswith(".apk"):
+            return "Error: File must be an APK"
+        try:
+            # Use shell-based install to avoid adbutils verbose output
+            # First push the APK to device
+            remote_path = f"/data/local/tmp/{os.path.basename(apk_path)}"
+            self.current_device.sync.push(apk_path, remote_path)
+
+            # Then install using pm install
+            result = self.current_device.shell(f"pm install -r -t {remote_path}")
+
+            # Clean up
+            self.current_device.shell(f"rm {remote_path}")
+
+            if "Success" in result:
+                return f"Successfully installed: {os.path.basename(apk_path)}"
+            else:
+                # Return just the relevant error, not the full output
+                error_line = [l for l in result.split('\n') if l.strip()]
+                return f"Install failed: {error_line[-1] if error_line else 'Unknown error'}"
+        except Exception as e:
+            return f"Error installing: {e}"
+
+    def reinstall(self, apk_path: str) -> str:
+        """Reinstall an APK with -r -d flags to handle certificate conflicts."""
+        if not self.current_device:
+            return "Error: No device connected"
+
+        apk_path = os.path.expanduser(apk_path)
+
+        if not os.path.exists(apk_path):
+            return f"Error: File not found: {apk_path}"
+        if not apk_path.lower().endswith(".apk"):
+            return "Error: File must be an APK"
+        try:
+            remote_path = f"/data/local/tmp/{os.path.basename(apk_path)}"
+            self.current_device.sync.push(apk_path, remote_path)
+
+            result = self.current_device.shell(f"pm install -r -d {remote_path}")
+
+            self.current_device.shell(f"rm {remote_path}")
+
+            if "Success" in result:
+                return f"Successfully reinstalled: {os.path.basename(apk_path)}"
+            else:
+                error_line = [l for l in result.split('\n') if l.strip()]
+                return f"Reinstall failed: {error_line[-1] if error_line else 'Unknown error'}"
+        except Exception as e:
+            return f"Error reinstalling: {e}"
+
+    def uninstall(self, package: str) -> str:
+        """Uninstall an app from the device."""
+        if not self.current_device:
+            return "Error: No device connected"
+        try:
+            self.current_device.uninstall(package)
+            return f"Successfully uninstalled: {package}"
+        except Exception as e:
+            return f"Error uninstalling: {e}"
+
+    def pull(self, remote_path: str, local_path: Optional[str] = None) -> str:
+        """Pull a file from the device."""
+        if not self.current_device:
+            return "Error: No device connected"
+        try:
+            if local_path is None:
+                local_path = os.path.basename(remote_path)
+            self.current_device.sync.pull(remote_path, local_path)
+            return f"Pulled: {remote_path} -> {local_path}"
+        except Exception as e:
+            return f"Error pulling file: {e}"
+
+    def push(self, local_path: str, remote_path: str) -> str:
+        """Push a file to the device."""
+        if not self.current_device:
+            return "Error: No device connected"
+        if not os.path.exists(local_path):
+            return f"Error: Local file not found: {local_path}"
+        try:
+            self.current_device.sync.push(local_path, remote_path)
+            return f"Pushed: {local_path} -> {remote_path}"
+        except Exception as e:
+            return f"Error pushing file: {e}"
+
+    def screenshot(self, filename: Optional[str] = None) -> str:
+        """Take a screenshot and save it locally."""
+        if not self.current_device:
+            return "Error: No device connected"
+        try:
+            if filename is None:
+                from datetime import datetime
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                filename = f"screenshot_{timestamp}.png"
+
+            img = self.current_device.screenshot()
+            img.save(filename)
+            return f"Screenshot saved: {filename}"
+        except Exception as e:
+            return f"Error taking screenshot: {e}"
+
+    def reboot(self, mode: str = "") -> str:
+        """Reboot the device."""
+        if not self.current_device:
+            return "Error: No device connected"
+        try:
+            if mode:
+                self.current_device.shell(f"reboot {mode}")
+            else:
+                self.current_device.shell("reboot")
+            return f"Rebooting device{' into ' + mode if mode else ''}..."
+        except Exception as e:
+            return f"Error rebooting: {e}"
+
+    def list_packages(self, filter_text: str = "") -> str:
+        """List installed packages."""
+        if not self.current_device:
+            return "Error: No device connected"
+        try:
+            result = self.current_device.shell("pm list packages")
+            packages = [line.replace("package:", "") for line in result.strip().split("\n")]
+            if filter_text:
+                packages = [p for p in packages if filter_text.lower() in p.lower()]
+            packages.sort()
+            return "\n".join(packages) if packages else "No packages found"
+        except Exception as e:
+            return f"Error listing packages: {e}"
+
+    # ==================== Wireless Device Management ====================
+
+    _adb_path: Optional[str] = None
+
+    @classmethod
+    def _find_adb(cls) -> Optional[str]:
+        """Find the adb binary path."""
+        if cls._adb_path:
+            return cls._adb_path
+
+        import shutil
+
+        # Check PATH first
+        adb = shutil.which("adb")
+        if adb:
+            cls._adb_path = adb
+            return adb
+
+        # Common locations
+        locations = [
+            os.path.expanduser("~/Library/Android/sdk/platform-tools/adb"),
+            os.path.expanduser("~/Android/Sdk/platform-tools/adb"),
+            "/opt/homebrew/bin/adb",
+            "/usr/local/bin/adb",
+            "/usr/bin/adb",
+            # Windows
+            os.path.expanduser("~/AppData/Local/Android/Sdk/platform-tools/adb.exe"),
+        ]
+
+        for path in locations:
+            if os.path.isfile(path) and os.access(path, os.X_OK):
+                cls._adb_path = path
+                return path
+
+        return None
+
+    def _run_adb_command(self, args: list[str]) -> tuple[str, str]:
+        """Run an ADB command via subprocess."""
+        adb = self._find_adb()
+        if not adb:
+            return "", "ADB not found. Install Android SDK or add adb to PATH"
+
+        try:
+            result = subprocess.run(
+                [adb] + args,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            return result.stdout.strip(), result.stderr.strip()
+        except subprocess.TimeoutExpired:
+            return "", "Command timed out"
+        except FileNotFoundError:
+            return "", "ADB not found"
+        except Exception as e:
+            return "", str(e)
+
+    def is_wireless_device(self, serial: str) -> bool:
+        """Check if a device serial indicates a wireless connection."""
+        # Wireless devices have IP:port format
+        pattern = r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d+$"
+        return bool(re.match(pattern, serial))
+
+    def get_device_ip(self, device: Optional[AdbDevice] = None) -> Optional[str]:
+        """Get the WiFi IP address of a device."""
+        target = device or self.current_device
+        if not target:
+            return None
+
+        try:
+            # Try wlan0 first (most common)
+            result = target.shell("ip -f inet addr show wlan0")
+            for line in result.splitlines():
+                line = line.strip()
+                if line.startswith("inet "):
+                    ip = line.split()[1].split("/")[0]
+                    if ip.startswith(("192.", "10.", "172.")):
+                        return ip
+
+            # Fallback: try to get any wireless IP
+            result = target.shell("ip route get 1.1.1.1 2>/dev/null | head -1")
+            match = re.search(r"src (\d+\.\d+\.\d+\.\d+)", result)
+            if match:
+                return match.group(1)
+
+            return None
+        except Exception:
+            return None
+
+    def enable_tcpip(self, device: Optional[AdbDevice] = None, port: int = 5555) -> tuple[bool, str]:
+        """Enable TCP/IP mode on a device."""
+        target = device or self.current_device
+        if not target:
+            return False, "No device specified"
+
+        # Skip if already a wireless device
+        if self.is_wireless_device(target.serial):
+            return True, "Already in wireless mode"
+
+        stdout, stderr = self._run_adb_command(["-s", target.serial, "tcpip", str(port)])
+        if stderr and "error" in stderr.lower():
+            return False, stderr
+        return True, stdout or f"TCP/IP mode enabled on port {port}"
+
+    def connect_wireless(self, ip: str, port: int = 5555) -> tuple[bool, str]:
+        """Connect to a device via TCP/IP."""
+        address = f"{ip}:{port}" if ":" not in ip else ip
+        stdout, stderr = self._run_adb_command(["connect", address])
+
+        combined = stdout + stderr
+        if "connected" in combined.lower() or "already connected" in combined.lower():
+            # Save to state
+            state_manager.add_ip(address)
+            return True, f"Connected to {address}"
+        return False, combined or f"Failed to connect to {address}"
+
+    def disconnect_wireless(self, ip: str) -> tuple[bool, str]:
+        """Disconnect from a wireless device."""
+        address = ip if ":" in ip else f"{ip}:5555"
+        stdout, stderr = self._run_adb_command(["disconnect", address])
+
+        combined = stdout + stderr
+        if "disconnected" in combined.lower() or not stderr:
+            return True, f"Disconnected from {address}"
+        return False, combined or f"Failed to disconnect from {address}"
+
+    def auto_enable_wireless(self) -> list[tuple[str, bool, str]]:
+        """Auto-detect USB devices and enable wireless connections.
+
+        Returns list of (ip:port, success, message) tuples.
+        """
+        results = []
+        devices = self.list_devices()
+
+        for device in devices:
+            # Skip already wireless devices
+            if self.is_wireless_device(device.serial):
+                continue
+
+            # Get device IP
+            ip = self.get_device_ip(device)
+            if not ip:
+                results.append((device.serial, False, "Could not detect IP"))
+                continue
+
+            # Enable tcpip mode
+            success, msg = self.enable_tcpip(device)
+            if not success:
+                results.append((ip, False, f"tcpip failed: {msg}"))
+                continue
+
+            # Small delay to let tcpip mode activate
+            import time
+            time.sleep(1)
+
+            # Connect wirelessly
+            success, msg = self.connect_wireless(ip)
+            results.append((f"{ip}:5555", success, msg))
+
+        return results
+
+    def reconnect_saved(self) -> list[tuple[str, bool, str]]:
+        """Reconnect to all saved wireless devices.
+
+        Returns list of (ip:port, success, message) tuples.
+        """
+        results = []
+        saved_ips = state_manager.load_ips()
+
+        for ip in saved_ips:
+            stdout, stderr = self._run_adb_command(["connect", ip])
+            combined = stdout + stderr
+            if "connected" in combined.lower() or "already connected" in combined.lower():
+                results.append((ip, True, "Connected"))
+            else:
+                results.append((ip, False, combined or "Connection failed"))
+
+        return results
+
+    def get_all_devices_info(self) -> list[dict]:
+        """Get information about all connected devices with wireless status."""
+        devices = self.list_devices()
+        info_list = []
+
+        for device in devices:
+            is_wireless = self.is_wireless_device(device.serial)
+            try:
+                model = device.prop.model or "Unknown"
+            except Exception:
+                model = "Unknown"
+
+            info_list.append({
+                "serial": device.serial,
+                "model": model,
+                "is_wireless": is_wireless,
+                "type": "wireless" if is_wireless else "USB",
+            })
+
+        return info_list
+
+    def test_device(self) -> tuple[bool, str]:
+        """Test current device connectivity."""
+        if not self.current_device:
+            return False, "No device connected"
+
+        try:
+            model = self.current_device.shell("getprop ro.product.model").strip()
+            brand = self.current_device.shell("getprop ro.product.brand").strip()
+            android = self.current_device.shell("getprop ro.build.version.release").strip()
+
+            if model:
+                return True, f"Device OK: {brand} {model} (Android {android})"
+            return False, "Device not responding"
+        except Exception as e:
+            return False, f"Test failed: {e}"
+
+    def restart_server(self) -> tuple[bool, str, list[tuple[str, bool, str]]]:
+        """Restart ADB server and reconnect saved devices.
+
+        Returns (success, message, reconnect_results).
+        """
+        messages = []
+
+        # Kill server
+        stdout, stderr = self._run_adb_command(["kill-server"])
+        messages.append(f"Kill server: {stdout or stderr or 'OK'}")
+
+        # Start server
+        stdout, stderr = self._run_adb_command(["start-server"])
+        if stderr and "error" in stderr.lower():
+            return False, f"Failed to start server: {stderr}", []
+        messages.append(f"Start server: {stdout or stderr or 'OK'}")
+
+        # Reconnect saved devices
+        reconnect_results = self.reconnect_saved()
+
+        # Reset current device (it may have been disconnected)
+        self.current_device = None
+
+        return True, "\n".join(messages), reconnect_results
+
+    def get_saved_ips(self) -> list[str]:
+        """Get list of saved wireless IPs."""
+        return state_manager.load_ips()
+
+    def forget_ip(self, ip: str) -> bool:
+        """Remove an IP from saved list."""
+        return state_manager.remove_ip(ip)
