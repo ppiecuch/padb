@@ -1,5 +1,7 @@
 # PADB - Python ADB TUI
 
+![PADB Screenshot](padb.png)
+
 A terminal user interface for Android Debug Bridge operations built with Python and curses.
 
 ## Features
@@ -166,3 +168,16 @@ Add udev rules for your device or run with sudo (not recommended for production)
 ## License
 
 MIT License
+
+## Changelog
+
+### v0.2.0
+
+- Initial release
+- Device auto-detection and selection
+- Wireless ADB connection support
+- Interactive shell with command history
+- Meta commands support (@install, @pull, @push, @screenshot, etc.)
+- Live logcat streaming with regex filtering
+- Color-coded log levels
+- Auto-reconnect polling when device disconnects
