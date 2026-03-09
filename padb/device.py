@@ -385,6 +385,98 @@ class DeviceManager:
             return False, stderr
         return True, stdout or f"TCP/IP mode enabled on port {port}"
 
+    def discover_mdns(self) -> list[dict]:
+        """Discover wireless debugging devices via mDNS.
+
+        Returns list of dicts with keys: name, service, address (ip:port).
+        """
+        # Check if mdns is available
+        stdout, stderr = self._run_adb_command(["mdns", "check"])
+        if "mdns daemon" not in (stdout + stderr).lower():
+            return []
+
+        # Get discovered services
+        stdout, stderr = self._run_adb_command(["mdns", "services"])
+        if not stdout:
+            return []
+
+        devices = []
+        for line in stdout.splitlines():
+            # Format: name\tservice_type\tip:port
+            # Example: adb-RG405M01372952-P1y5Yg	_adb-tls-connect._tcp	192.168.1.35:37055
+            parts = line.split("\t")
+            if len(parts) >= 3 and ":" in parts[2]:
+                service_type = parts[1].strip()
+                # _adb-tls-connect = ready to connect (already paired)
+                # _adb-tls-pairing = waiting to pair
+                devices.append({
+                    "name": parts[0].strip(),
+                    "service": service_type,
+                    "address": parts[2].strip(),
+                    "needs_pairing": "_pairing" in service_type,
+                })
+        return devices
+
+    def discover_and_connect(self) -> list[tuple[str, bool, str]]:
+        """Discover devices via mDNS and connect to ones that are ready.
+
+        Returns list of (address, success, message) tuples.
+        """
+        discovered = self.discover_mdns()
+        if not discovered:
+            return []
+
+        results = []
+        for device in discovered:
+            if device["needs_pairing"]:
+                results.append((
+                    device["address"],
+                    False,
+                    f"Needs pairing first ({device['name']})",
+                ))
+                continue
+
+            success, msg = self.connect_wireless(device["address"])
+            if success:
+                state_manager.add_ip(device["address"])
+            results.append((device["address"], success, f"{msg} ({device['name']})"))
+
+        return results
+
+    def pair_wireless(self, ip: str, port: int = 0, pairing_code: str = "") -> tuple[bool, str]:
+        """Pair with a device using Android 11+ wireless debugging.
+
+        Args:
+            ip: Device IP address (may include :port).
+            port: Pairing port shown on device (random high port).
+            pairing_code: 6-digit pairing code shown on device.
+        """
+        if not pairing_code:
+            return False, "Pairing code is required"
+
+        # Build address
+        if ":" in ip:
+            address = ip
+        elif port:
+            address = f"{ip}:{port}"
+        else:
+            return False, "Pairing port is required (shown on device screen)"
+
+        stdout, stderr = self._run_adb_command(["pair", address, pairing_code])
+        combined = stdout + stderr
+
+        if "successfully paired" in combined.lower():
+            # After pairing, try to find and connect to the device's debug port
+            # The debug port is different from the pairing port
+            return True, f"Successfully paired with {address}"
+        elif "failed" in combined.lower():
+            return False, combined or f"Pairing failed with {address}"
+        else:
+            # Some versions return different messages
+            if stderr and "error" in stderr.lower():
+                return False, stderr
+            return True, combined or f"Pair command sent to {address}"
+
     def connect_wireless(self, ip: str, port: int = 5555) -> tuple[bool, str]:
         """Connect to a device via TCP/IP."""
         address = f"{ip}:{port}" if ":" not in ip else ip

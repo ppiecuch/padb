@@ -1,6 +1,8 @@
 """Main TUI application using curses."""
 
 import curses
+import re
+import socket
 import time
 from typing import Optional
 
@@ -69,7 +71,12 @@ class Application:
         """Show device selection dialog. Returns True if device selected."""
         devices = self.device_manager.list_devices()
 
-        # No devices - wait for connection
+        # No devices — try reconnecting saved wireless IPs and mDNS discovery
+        if not devices:
+            self._try_auto_reconnect()
+            devices = self.device_manager.list_devices()
+
+        # Still no devices - wait for connection
         if not devices:
             return self.wait_for_device()
 
@@ -79,6 +86,255 @@ class Application:
 
         # Multiple devices - show selector
         return self.show_device_list(devices)
+
+    def _try_auto_reconnect(self) -> None:
+        """Try to reconnect saved wireless devices and discover via mDNS."""
+        # First try saved IPs
+        saved = self.device_manager.get_saved_ips()
+        if saved:
+            self.device_manager.reconnect_saved()
+            if self.device_manager.list_devices():
+                return
+
+        # Then try mDNS discovery
+        self.device_manager.discover_and_connect()
+
+    @staticmethod
+    def _get_local_ip_prefix() -> str:
+        """Get the local network IP prefix (e.g. '192.168.1.')."""
+        try:
+            # Connect to a public DNS to determine the local IP
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.settimeout(1)
+            s.connect(("8.8.8.8", 80))
+            local_ip = s.getsockname()[0]
+            s.close()
+            # Return first 3 octets as prefix
+            parts = local_ip.split(".")
+            if len(parts) == 4:
+                return f"{parts[0]}.{parts[1]}.{parts[2]}."
+        except Exception:
+            pass
+        return "192.168.1."
+
+    def _curses_input(self, y: int, x: int, prompt: str,
+                      prefill: str = "", max_len: int = 40) -> Optional[str]:
+        """Read a line of text input at the given position.
+
+        Returns the entered string, or None if cancelled with ESC.
+        """
+        curses.curs_set(1)
+        self.stdscr.addstr(y, x, prompt)
+        self.stdscr.refresh()
+
+        buf = list(prefill)
+        cursor = len(buf)
+        input_x = x + len(prompt)
+
+        while True:
+            # Draw current input with padding to clear old chars
+            display = "".join(buf)
+            self.stdscr.addstr(y, input_x, display + " " * (max_len - len(display)))
+            self.stdscr.move(y, input_x + cursor)
+            self.stdscr.refresh()
+
+            key = self.stdscr.getch()
+            if key in (curses.KEY_ENTER, 10, 13):
+                return "".join(buf)
+            elif key == 27:  # ESC
+                return None
+            elif key in (curses.KEY_BACKSPACE, 127, 8):
+                if cursor > 0:
+                    buf.pop(cursor - 1)
+                    cursor -= 1
+            elif key == curses.KEY_DC:  # Delete
+                if cursor < len(buf):
+                    buf.pop(cursor)
+            elif key == curses.KEY_LEFT:
+                if cursor > 0:
+                    cursor -= 1
+            elif key == curses.KEY_RIGHT:
+                if cursor < len(buf):
+                    cursor += 1
+            elif key == curses.KEY_HOME:
+                cursor = 0
+            elif key == curses.KEY_END:
+                cursor = len(buf)
+            elif 32 <= key <= 126 and len(buf) < max_len:
+                buf.insert(cursor, chr(key))
+                cursor += 1
+
+    def _show_pair_dialog(self) -> bool:
+        """Show wireless pairing dialog. Returns True if device paired and connected."""
+        self.stdscr.clear()
+        height, width = self.stdscr.getmaxyx()
+        ip_prefix = self._get_local_ip_prefix()
+
+        # Header
+        title = "Wireless Pairing (Android 11+)"
+        self.stdscr.addstr(1, (width - len(title)) // 2, title, curses.A_BOLD)
+
+        # Instructions
+        instructions = [
+            "On your device:",
+            "  1. Settings > Developer Options > Wireless debugging",
+            "  2. Tap 'Pair device with pairing code'",
+            "  3. Enter the IP, port, and code shown below",
+        ]
+        y = 3
+        for line in instructions:
+            self.stdscr.addstr(y, 4, line)
+            y += 1
+
+        y += 1
+        self.stdscr.addstr(y + 3, 4, "(ESC to cancel at any step)")
+        self.stdscr.refresh()
+
+        # Collect IP
+        ip = self._curses_input(y, 4, "IP address: ", prefill=ip_prefix)
+        if ip is None:
+            return False
+
+        # Collect port
+        y += 1
+        port = self._curses_input(y, 4, "Pairing port: ")
+        if port is None:
+            return False
+        if not port.isdigit():
+            self.stdscr.addstr(y + 2, 4, "Invalid port number. Press any key.")
+            self.stdscr.refresh()
+            self.stdscr.getch()
+            return False
+
+        # Collect pairing code
+        y += 1
+        code = self._curses_input(y, 4, "Pairing code: ")
+        if code is None:
+            return False
+
+        # Execute pairing
+        y += 2
+        address = f"{ip}:{port}"
+        self.stdscr.addstr(y, 4, f"Pairing with {address}...")
+        self.stdscr.refresh()
+
+        success, msg = self.device_manager.pair_wireless(
+            ip=address, pairing_code=code
+        )
+
+        y += 1
+        if success:
+            self.stdscr.addstr(y, 4, msg, curses.color_pair(1) | curses.A_BOLD)
+            y += 2
+
+            # Prompt for connection port
+            self.stdscr.addstr(y, 4, "Now connect to the device.")
+            y += 1
+            self.stdscr.addstr(y, 4, "Use the port from 'Wireless debugging' screen")
+            self.stdscr.addstr(y + 1, 4, "(NOT the pairing port).")
+            y += 2
+            conn_port = self._curses_input(y, 4, "Connection port: ")
+            if conn_port is None:
+                return False
+            if not conn_port.isdigit():
+                self.stdscr.addstr(y + 2, 4, "Invalid port. Press any key.")
+                self.stdscr.refresh()
+                self.stdscr.getch()
+                return False
+
+            conn_address = f"{ip}:{conn_port}"
+            y += 1
+            self.stdscr.addstr(y, 4, f"Connecting to {conn_address}...")
+            self.stdscr.refresh()
+
+            conn_ok, conn_msg = self.device_manager.connect_wireless(conn_address)
+            y += 1
+            if conn_ok:
+                self.stdscr.addstr(y, 4, conn_msg, curses.color_pair(1) | curses.A_BOLD)
+                self.stdscr.refresh()
+                time.sleep(1)
+
+                # Select the newly connected device
+                devices = self.device_manager.list_devices()
+                for dev in devices:
+                    if dev.serial == conn_address:
+                        self.device_manager.connect(dev)
+                        return True
+                # If exact match not found, try partial IP match
+                for dev in devices:
+                    if ip in dev.serial:
+                        self.device_manager.connect(dev)
+                        return True
+                if devices:
+                    self.device_manager.connect(devices[0])
+                    return True
+            else:
+                self.stdscr.addstr(y, 4, conn_msg, curses.color_pair(2) | curses.A_BOLD)
+        else:
+            self.stdscr.addstr(y, 4, msg, curses.color_pair(2) | curses.A_BOLD)
+
+        y += 2
+        self.stdscr.addstr(y, 4, "Press any key to continue...")
+        self.stdscr.refresh()
+        self.stdscr.getch()
+        return False
+
+    def _try_mdns_connect(self) -> bool:
+        """Try mDNS discovery and connect. Shows status on screen."""
+        self.stdscr.clear()
+        height, width = self.stdscr.getmaxyx()
+
+        title = "mDNS Device Discovery"
+        self.stdscr.addstr(1, (width - len(title)) // 2, title, curses.A_BOLD)
+        self.stdscr.addstr(3, 4, "Scanning for wireless debugging devices...")
+        self.stdscr.refresh()
+
+        results = self.device_manager.discover_and_connect()
+        y = 5
+
+        if not results:
+            discovered = self.device_manager.discover_mdns()
+            if not discovered:
+                self.stdscr.addstr(y, 4, "No devices found via mDNS.", curses.color_pair(2))
+                self.stdscr.addstr(y + 1, 4, "Ensure wireless debugging is enabled on the device.")
+            else:
+                self.stdscr.addstr(y, 4, "Found devices but none ready to connect:")
+                for d in discovered:
+                    y += 1
+                    status = "needs pairing" if d["needs_pairing"] else "ready"
+                    self.stdscr.addstr(y, 6, f"{d['address']} ({d['name']}) [{status}]")
+            y += 2
+            self.stdscr.addstr(y, 4, "Press any key to continue...")
+            self.stdscr.refresh()
+            self.stdscr.getch()
+            return False
+
+        for addr, success, msg in results:
+            status_str = "[OK]" if success else "[FAIL]"
+            color = curses.color_pair(1) if success else curses.color_pair(2)
+            self.stdscr.addstr(y, 4, f"{status_str} {addr}: {msg}", color)
+            y += 1
+
+            if success:
+                y += 1
+                self.stdscr.addstr(y, 4, "Connected!", curses.color_pair(1) | curses.A_BOLD)
+                self.stdscr.refresh()
+                time.sleep(1)
+
+                devices = self.device_manager.list_devices()
+                for dev in devices:
+                    if dev.serial == addr:
+                        self.device_manager.connect(dev)
+                        return True
+                if devices:
+                    self.device_manager.connect(devices[0])
+                    return True
+
+        y += 1
+        self.stdscr.addstr(y, 4, "Press any key to continue...")
+        self.stdscr.refresh()
+        self.stdscr.getch()
+        return False
 
     def wait_for_device(self) -> bool:
         """Wait for a device to be connected, checking every 5 seconds."""
@@ -110,7 +366,7 @@ class Application:
             self.stdscr.addstr(height // 2 + 2, (width - len(check_msg)) // 2, check_msg, curses.A_DIM)
 
             # Help
-            help_text = "Press Q to quit"
+            help_text = "D: Discover (mDNS) | P: Pair wirelessly | Q: Quit"
             self.stdscr.addstr(height - 2, (width - len(help_text)) // 2, help_text)
 
             self.stdscr.refresh()
@@ -126,10 +382,31 @@ class Application:
                     else:
                         return self.show_device_list(devices)
 
+                # No devices found via USB/existing connections — try mDNS discovery
+                results = self.device_manager.discover_and_connect()
+                for addr, success, msg in results:
+                    if success:
+                        devices = self.device_manager.list_devices()
+                        if devices:
+                            if len(devices) == 1:
+                                self.device_manager.connect(devices[0])
+                                return True
+                            else:
+                                return self.show_device_list(devices)
+
             # Handle input
             key = self.stdscr.getch()
             if key in (ord("q"), ord("Q"), 3):  # Q or Ctrl+C
                 return False
+            elif key in (ord("d"), ord("D")):
+                if self._try_mdns_connect():
+                    return True
+                last_check = time.time()
+            elif key in (ord("p"), ord("P")):
+                if self._show_pair_dialog():
+                    return True
+                # Reset check timer after returning from dialog
+                last_check = time.time()
 
             # Update spinner
             spinner_idx += 1

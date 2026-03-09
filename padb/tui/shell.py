@@ -42,6 +42,8 @@ META_COMMANDS = [
     ("tap", "Tap at coordinates"),
     ("swipe", "Swipe gesture"),
     # Wireless device management
+    ("discover", "Discover and connect via mDNS"),
+    ("pair", "Pair with device (Android 11+)"),
     ("wireless", "Auto-detect and connect wirelessly"),
     ("connect", "Connect to device by IP"),
     ("reconnect", "Reconnect saved wireless devices"),
@@ -86,6 +88,8 @@ System:
   @server restart          - Restart ADB server
 
 Wireless Device Management:
+  @discover                - Discover devices via mDNS and auto-connect
+  @pair <ip:port> <code>   - Pair with device (Android 11+ wireless debugging)
   @wireless                - Auto-detect USB devices, enable wireless
   @connect <ip[:port]>     - Connect to device by IP
   @disconnect <ip>         - Disconnect from wireless device
@@ -559,6 +563,56 @@ class ShellWindow:
                 return "Error: coordinates must be integers"
 
         # ==================== Wireless Device Management ====================
+
+        elif cmd == "discover":
+            results = self.device_manager.discover_and_connect()
+            if not results:
+                # Show raw discovery too
+                discovered = self.device_manager.discover_mdns()
+                if not discovered:
+                    return "No devices found via mDNS.\nEnsure wireless debugging is enabled on the device."
+                lines = ["Discovered but could not connect:"]
+                for d in discovered:
+                    status = "needs pairing" if d["needs_pairing"] else "ready"
+                    lines.append(f"  {d['address']} ({d['name']}) [{status}]")
+                return "\n".join(lines)
+            lines = ["mDNS discovery results:"]
+            for addr, success, msg in results:
+                status = "[OK]" if success else "[FAIL]"
+                lines.append(f"  {status} {addr}: {msg}")
+            return "\n".join(lines)
+
+        elif cmd == "pair":
+            if len(args) < 2:
+                return (
+                    "Usage: @pair <ip:port> <pairing-code>\n"
+                    "\n"
+                    "Android 11+ wireless debugging:\n"
+                    "  1. On device: Settings > Developer Options > Wireless debugging\n"
+                    "  2. Tap 'Pair device with pairing code'\n"
+                    "  3. Note the IP:port and 6-digit code shown\n"
+                    "  4. Run: @pair <ip:port> <code>\n"
+                    "  5. After pairing, connect with: @connect <ip:port>\n"
+                    "     (use the IP:port from 'Wireless debugging' screen,\n"
+                    "      NOT the pairing port)"
+                )
+            address = args[0]
+            pairing_code = args[1]
+            if ":" not in address:
+                return "Error: Pairing requires ip:port (port shown on device pairing screen)"
+            success, msg = self.device_manager.pair_wireless(
+                ip=address, pairing_code=pairing_code
+            )
+            if success:
+                # Extract IP for follow-up connect hint
+                ip_part = address.split(":")[0]
+                return (
+                    f"{msg}\n"
+                    f"\nNext: connect with @connect <ip:port>\n"
+                    f"Use the IP:port shown on the 'Wireless debugging' screen\n"
+                    f"(different from the pairing port)"
+                )
+            return msg
 
         elif cmd == "wireless":
             results = self.device_manager.auto_enable_wireless()
