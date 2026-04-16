@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Optional
 
 from ..device import DeviceManager
+from .cmdr import Commander
 
 
 # History file path
@@ -42,6 +43,7 @@ META_COMMANDS = [
     ("tap", "Tap at coordinates"),
     ("swipe", "Swipe gesture"),
     # Wireless device management
+    ("cmdr", "Open two-panel file commander (local \u2194 remote)"),
     ("discover", "Discover and connect via mDNS"),
     ("pair", "Pair with device (Android 11+)"),
     ("wireless", "Auto-detect and connect wirelessly"),
@@ -62,6 +64,7 @@ Available meta commands:
 
 Device Operations:
   @help                    - Show this help
+  @cmdr                    - Open two-panel file commander (local \u2194 remote)
   @clear                   - Clear shell output
   @info                    - Show device info
   @test                    - Test device connectivity
@@ -121,6 +124,8 @@ class ShellWindow:
         # Cursor position for rendering (set during refresh)
         self._cursor_y = 0
         self._cursor_x = 0
+        # Two-panel file commander (active when not None)
+        self._commander: Optional[Commander] = None
         # Load history from file
         self._load_history()
 
@@ -148,6 +153,11 @@ class ShellWindow:
     def set_active(self, active: bool) -> None:
         """Set whether this window is active."""
         self.active = active
+
+    @property
+    def is_cmdr_active(self) -> bool:
+        """True while the two-panel commander is running."""
+        return self._commander is not None
 
     def get_cursor_position(self) -> tuple[int, int]:
         """Get the cursor position for when this window is active."""
@@ -321,6 +331,13 @@ class ShellWindow:
 
     def handle_input(self, key: int) -> None:
         """Handle keyboard input."""
+        if self._commander is not None:
+            still_active = self._commander.handle_input(key)
+            if not still_active:
+                self._commander = None
+                curses.curs_set(1)
+            return
+
         # Handle suggestion navigation when in suggestion mode
         if self.suggestion_mode and self.suggestions:
             if key == curses.KEY_UP:
@@ -379,6 +396,10 @@ class ShellWindow:
             self._scroll_up()
         elif key == curses.KEY_NPAGE:  # Page Down
             self._scroll_down()
+        elif key == ord("?") and not self.current_input:
+            for line in META_COMMANDS_HELP.split("\n"):
+                self.output_lines.append(line)
+            self.scroll_offset = 0
         elif 32 <= key <= 126:  # Printable characters
             self.current_input = (
                 self.current_input[: self.cursor_pos]
@@ -471,7 +492,13 @@ class ShellWindow:
         cmd = parts[0].lower()
         args = parts[1:]
 
-        if cmd == "help":
+        if cmd == "cmdr":
+            if not self.device_manager.current_device:
+                return "Error: No device connected"
+            self._commander = Commander(self.window, self.device_manager)
+            return ""
+
+        elif cmd == "help":
             return META_COMMANDS_HELP
 
         elif cmd == "clear":
@@ -702,6 +729,10 @@ class ShellWindow:
 
     def refresh(self) -> None:
         """Refresh the window display."""
+        if self._commander is not None:
+            self._commander.draw()
+            return
+
         self.window.erase()
         height, width = self.get_dimensions()
 

@@ -621,3 +621,94 @@ class DeviceManager:
     def forget_ip(self, ip: str) -> bool:
         """Remove an IP from saved list."""
         return state_manager.remove_ip(ip)
+
+    # ==================== Remote Filesystem Operations ====================
+
+    _LS_MODERN = re.compile(
+        r"^(?P<perms>[dl\-][rwxst\-]{9})\s+\d+\s+\S+\s+(?:\S+\s+)?"
+        r"(?P<size>\d+)\s+\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}\s+(?P<name>.+)$"
+    )
+    _LS_LEGACY = re.compile(
+        r"^(?P<perms>[dl\-][rwxst\-]{9})\s+\d+\s+\S+\s+(?:\S+\s+)?"
+        r"(?P<size>\d+)\s+[A-Z][a-z]{2}\s+\d{1,2}\s+[\d:]+\s+(?P<name>.+)$"
+    )
+
+    def list_remote_dir(self, path: str) -> list[dict]:
+        """List files in a remote directory.
+
+        Returns list of dicts: {name, is_dir, is_link, size}.
+        """
+        if not self.current_device:
+            return []
+
+        raw = self.shell(f"ls -la '{path}' 2>/dev/null")
+        if not raw or raw.startswith("Error:"):
+            return []
+
+        entries: list[dict] = []
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line or line.startswith("total"):
+                continue
+
+            m = self._LS_MODERN.match(line) or self._LS_LEGACY.match(line)
+            if not m:
+                continue
+
+            perms = m.group("perms")
+            name = m.group("name").strip()
+            size = int(m.group("size"))
+            is_dir = perms.startswith("d")
+            is_link = perms.startswith("l")
+
+            # Capture and strip symlink target
+            link_target = ""
+            if is_link and " -> " in name:
+                parts = name.split(" -> ", 1)
+                name = parts[0]
+                link_target = parts[1] if len(parts) > 1 else ""
+
+            if name in (".", ".."):
+                continue
+
+            entries.append({
+                "name": name,
+                "is_dir": is_dir,
+                "is_link": is_link,
+                "link_target": link_target,
+                "size": size,
+            })
+
+        # Batch-test which symlinks resolve to directories (one shell round-trip)
+        link_names = [e["name"] for e in entries if e["is_link"]]
+        if link_names:
+            quoted = " ".join(f"'{n}'" for n in link_names)
+            result = self.shell(
+                f"cd '{path}' 2>/dev/null && "
+                f"for f in {quoted}; do [ -d \"$f\" ] && printf '%s\\n' \"$f\"; done 2>/dev/null"
+            )
+            dir_links = set((result or "").splitlines())
+            for e in entries:
+                if e["is_link"] and e["name"] in dir_links:
+                    e["is_dir"] = True
+
+        return entries
+
+    def remote_mkdir(self, path: str) -> tuple[bool, str]:
+        """Create a directory on the device."""
+        if not self.current_device:
+            return False, "No device connected"
+        result = self.shell(f"mkdir -p '{path}' 2>&1")
+        if result.strip():
+            return False, result.strip()
+        return True, f"Created: {path}"
+
+    def remote_delete(self, path: str, recursive: bool = False) -> tuple[bool, str]:
+        """Delete a file or directory on the device."""
+        if not self.current_device:
+            return False, "No device connected"
+        flag = "-rf" if recursive else "-f"
+        result = self.shell(f"rm {flag} '{path}' 2>&1")
+        if result.strip():
+            return False, result.strip()
+        return True, f"Deleted: {path}"

@@ -6,10 +6,11 @@ A terminal user interface for Android Debug Bridge operations built with Python 
 
 ## Features
 
-- **Device Management**: Auto-detect and connect to Android devices, auto-reconnect polling when no device connected
+- **Device Management**: Auto-detect and connect to Android devices, background auto-reconnect when no device connected
 - **Wireless Pairing (Android 11+)**: Pair and connect wirelessly without USB using `adb pair` — accessible from the waiting screen (press P) or via `@pair` command
 - **Wireless Debugging (Legacy)**: Auto-detect USB devices and enable wireless mode via `adb tcpip`, with persistent IP storage and auto-reconnect
-- **Interactive Shell**: Execute ADB shell commands with command history (UP/DOWN keys)
+- **Two-Panel File Commander**: Norton Commander-style dual-panel browser (`@cmdr`) — navigate local and device filesystems side by side, copy/delete/rename/mkdir files
+- **Interactive Shell**: Execute ADB shell commands with command history (UP/DOWN keys), press `?` for inline help
 - **Meta Commands**: Built-in commands for install, pull, push, screenshot, and more
 - **Live Logcat**: Real-time log streaming with regex filtering
 - **Color-coded Logs**: Visual distinction between error, warning, info, and debug messages
@@ -73,6 +74,7 @@ The top window provides an interactive shell for executing commands on the devic
 | Page Up/Down | Scroll output |
 | Left/Right | Move cursor |
 | Home/End | Jump to start/end of line |
+| ? | Show meta command help (when input is empty) |
 
 **Example shell commands:**
 ```
@@ -89,6 +91,7 @@ The shell supports special meta commands prefixed with `@`:
 | Command | Description |
 |---------|-------------|
 | `@help` | Show all available meta commands |
+| `@cmdr` | Open two-panel file commander (local ↔ remote) |
 | `@clear` | Clear shell output |
 | `@info` | Show device information |
 | `@install <path>` | Install APK from local path |
@@ -124,7 +127,27 @@ The shell supports special meta commands prefixed with `@`:
 @pair 192.168.1.5:37123 123456
 @connect 192.168.1.5:41567
 @wireless
+@cmdr
 ```
+
+### File Commander
+
+Launch the two-panel file commander with `@cmdr`. The left panel shows the local filesystem; the right panel shows the device filesystem.
+
+| Key | Action |
+|-----|--------|
+| TAB / ←→ | Switch active panel |
+| ↑↓ | Navigate entries |
+| Page Up/Down | Jump 10 entries |
+| ENTER | Open directory |
+| C / F5 | Copy selected file to other panel |
+| D / F8 | Delete selected file or directory |
+| M / F7 | Create new directory |
+| R / F6 | Rename selected entry |
+| Ctrl+R | Refresh both panels |
+| ESC / Q | Exit commander |
+
+The status bar shows current panel paths while the commander is active. Panel paths are remembered across sessions in `.padbrc`.
 
 ### Logcat Window
 
@@ -163,6 +186,7 @@ padb/
     └── tui/             # TUI components
         ├── app.py       # Main application
         ├── shell.py     # Shell window
+        ├── cmdr.py      # Two-panel file commander
         ├── logcat.py    # Logcat window
         └── status.py    # Status bar
 ```
@@ -188,6 +212,19 @@ Add udev rules for your device or run with sudo (not recommended for production)
 MIT License
 
 ## Changelog
+
+### v0.5.0
+
+- Two-panel file commander (`@cmdr`): Norton Commander-style dual-panel browser with local and device filesystems side by side
+- File operations in commander: copy (C/F5), delete (D/F8), mkdir (M/F7), rename (R/F6), refresh (Ctrl+R)
+- Remote filesystem API in `device.py`: `list_remote_dir()`, `remote_mkdir()`, `remote_delete()` (handles both modern and legacy Android `ls` formats)
+- Background auto-reconnect thread on the waiting screen — tries saved IPs then mDNS, shows live status without blocking the UI
+- ASCII art logo on the waiting screen
+- `?` key in shell to show meta command help inline (when input is empty)
+- Commander panel paths persisted to `.padbrc`; status bar shows active panel paths while commander is open
+- Help line in status bar updates dynamically to show commander keybindings when commander is active
+
+![CMDR Screenshot](cmdr.png)
 
 ### v0.4.0
 

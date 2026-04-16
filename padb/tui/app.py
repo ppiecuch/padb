@@ -3,6 +3,7 @@
 import curses
 import re
 import socket
+import threading
 import time
 from typing import Optional
 
@@ -71,12 +72,7 @@ class Application:
         """Show device selection dialog. Returns True if device selected."""
         devices = self.device_manager.list_devices()
 
-        # No devices — try reconnecting saved wireless IPs and mDNS discovery
-        if not devices:
-            self._try_auto_reconnect()
-            devices = self.device_manager.list_devices()
-
-        # Still no devices - wait for connection
+        # No devices - wait for connection (auto-reconnect runs in background there)
         if not devices:
             return self.wait_for_device()
 
@@ -86,18 +82,6 @@ class Application:
 
         # Multiple devices - show selector
         return self.show_device_list(devices)
-
-    def _try_auto_reconnect(self) -> None:
-        """Try to reconnect saved wireless devices and discover via mDNS."""
-        # First try saved IPs
-        saved = self.device_manager.get_saved_ips()
-        if saved:
-            self.device_manager.reconnect_saved()
-            if self.device_manager.list_devices():
-                return
-
-        # Then try mDNS discovery
-        self.device_manager.discover_and_connect()
 
     @staticmethod
     def _get_local_ip_prefix() -> str:
@@ -339,31 +323,113 @@ class Application:
     def wait_for_device(self) -> bool:
         """Wait for a device to be connected, checking every 5 seconds."""
         self.stdscr.timeout(100)  # 100ms for responsive UI
-        last_check = time.time()
         check_interval = 5.0
         spinner_chars = "|/-\\"
         spinner_idx = 0
+
+        # Background reconnect state
+        bg_lock = threading.Lock()
+        bg_status = {"text": "", "done": False, "found": False}
+
+        def bg_reconnect():
+            """Try saved IPs and mDNS in background, repeating periodically."""
+            while self.running:
+                # Try saved IPs
+                saved = self.device_manager.get_saved_ips()
+                if saved:
+                    for ip in saved:
+                        if not self.running:
+                            return
+                        with bg_lock:
+                            bg_status["text"] = f"Reconnecting {ip}..."
+                        stdout, stderr = self.device_manager._run_adb_command(["connect", ip])
+                        combined = stdout + stderr
+                        if "connected" in combined.lower() or "already connected" in combined.lower():
+                            with bg_lock:
+                                bg_status["found"] = True
+                                bg_status["text"] = f"Connected to {ip}"
+                            return
+
+                # Try mDNS discovery
+                if not self.running:
+                    return
+                with bg_lock:
+                    bg_status["text"] = "Scanning mDNS..."
+                results = self.device_manager.discover_and_connect()
+                for addr, success, msg in results:
+                    if success:
+                        with bg_lock:
+                            bg_status["found"] = True
+                            bg_status["text"] = f"Connected to {addr}"
+                        return
+
+                with bg_lock:
+                    bg_status["text"] = ""
+
+                # Wait before retrying (check self.running frequently)
+                for _ in range(50):  # 5 seconds in 100ms steps
+                    if not self.running:
+                        return
+                    time.sleep(0.1)
+
+        # Start background reconnect immediately
+        bg_thread = threading.Thread(target=bg_reconnect, daemon=True)
+        bg_thread.start()
+
+        last_check = time.time()
 
         while self.running:
             self.stdscr.clear()
             height, width = self.stdscr.getmaxyx()
 
+            # ASCII art logo
+            logo = [
+                r" ____   _    ____  ____  ",
+                r"|  _ \ / \  |  _ \| __ ) ",
+                r"| |_) / _ \ | | | |  _ \ ",
+                r"|  __/ ___ \| |_| | |_) |",
+                r"|_| /_/   \_\____/|____/ ",
+            ]
+            logo_y = max(1, (height // 2) - 6)
+            for i, line in enumerate(logo):
+                x = max(0, (width - len(line)) // 2)
+                try:
+                    self.stdscr.addstr(logo_y + i, x, line, curses.color_pair(4) | curses.A_BOLD)
+                except curses.error:
+                    pass
+
             # Title with version
-            title = f"PADB v{__version__} - Waiting for device"
-            self.stdscr.addstr(1, (width - len(title)) // 2, title, curses.A_BOLD)
+            title = f"v{__version__} - Python ADB TUI"
+            title_y = logo_y + len(logo) + 1
+            self.stdscr.addstr(title_y, (width - len(title)) // 2, title, curses.A_DIM)
 
             # Spinner and message
             spinner = spinner_chars[spinner_idx % len(spinner_chars)]
             msg = f"  {spinner}  No devices connected. Waiting..."
-            self.stdscr.addstr(height // 2, (width - len(msg)) // 2, msg)
+            self.stdscr.addstr(title_y + 2, (width - len(msg)) // 2, msg)
 
-            # Check interval info
-            now = time.time()
-            next_check = int(check_interval - (now - last_check))
-            if next_check < 0:
-                next_check = 0
-            check_msg = f"Next check in {next_check}s"
-            self.stdscr.addstr(height // 2 + 2, (width - len(check_msg)) // 2, check_msg, curses.A_DIM)
+            # Show background status if active
+            with bg_lock:
+                status_text = bg_status["text"]
+                bg_done = bg_status["done"]
+                bg_found = bg_status["found"]
+            if status_text:
+                self.stdscr.addstr(
+                    title_y + 3, (width - len(status_text)) // 2,
+                    status_text, curses.A_DIM,
+                )
+
+            # Check if background or foreground found a device
+            with bg_lock:
+                bg_found_now = bg_status["found"]
+            if bg_found_now:
+                devices = self.device_manager.list_devices()
+                if devices:
+                    if len(devices) == 1:
+                        self.device_manager.connect(devices[0])
+                        return True
+                    else:
+                        return self.show_device_list(devices)
 
             # Help
             help_text = "D: Discover (mDNS) | P: Pair wirelessly | Q: Quit"
@@ -371,7 +437,8 @@ class Application:
 
             self.stdscr.refresh()
 
-            # Check for new devices every 5 seconds
+            # Fast foreground check for USB/already-connected devices
+            now = time.time()
             if now - last_check >= check_interval:
                 last_check = now
                 devices = self.device_manager.list_devices()
@@ -381,18 +448,6 @@ class Application:
                         return True
                     else:
                         return self.show_device_list(devices)
-
-                # No devices found via USB/existing connections — try mDNS discovery
-                results = self.device_manager.discover_and_connect()
-                for addr, success, msg in results:
-                    if success:
-                        devices = self.device_manager.list_devices()
-                        if devices:
-                            if len(devices) == 1:
-                                self.device_manager.connect(devices[0])
-                                return True
-                            else:
-                                return self.show_device_list(devices)
 
             # Handle input
             key = self.stdscr.getch()
@@ -405,7 +460,6 @@ class Application:
             elif key in (ord("p"), ord("P")):
                 if self._show_pair_dialog():
                     return True
-                # Reset check timer after returning from dialog
                 last_check = time.time()
 
             # Update spinner
@@ -465,7 +519,10 @@ class Application:
     def draw_help_line(self) -> None:
         """Draw the help line at the bottom."""
         height, width = self.stdscr.getmaxyx()
-        help_text = " TAB: Switch window | F1: Shell | F2: Logcat | Ctrl+C: Quit "
+        if self.shell_window and self.shell_window.is_cmdr_active:
+            help_text = self.shell_window._commander.CMDR_HELP
+        else:
+            help_text = " TAB: Switch window | F1: Shell | F2: Logcat | ?: Help | Ctrl+C: Quit "
         try:
             self.stdscr.addstr(
                 height - 1, 0, help_text.center(width)[:width - 1], curses.A_REVERSE
@@ -477,8 +534,11 @@ class Application:
         """Handle keyboard input."""
         # Global keys
         if key == 9:  # TAB
-            # If shell is active and in suggestion mode, pass TAB to shell
-            if (self.active_window == "shell" and self.shell_window
+            # Commander captures TAB for panel switching
+            if self.shell_window and self.shell_window.is_cmdr_active:
+                self.shell_window.handle_input(key)
+            # Shell captures TAB for autocomplete suggestion mode
+            elif (self.active_window == "shell" and self.shell_window
                     and self.shell_window.suggestion_mode):
                 self.shell_window.handle_input(key)
             else:
@@ -514,6 +574,13 @@ class Application:
     def refresh_all(self) -> None:
         """Refresh all windows."""
         if self.status_bar:
+            if self.shell_window and self.shell_window.is_cmdr_active:
+                c = self.shell_window._commander
+                lp = c.left.path
+                rp = c.right.path
+                self.status_bar.override_text = f" CMDR | Local: {lp} | Remote: {rp} "
+            else:
+                self.status_bar.override_text = None
             self.status_bar.refresh()
         if self.logcat_window:
             self.logcat_window.refresh()
@@ -521,10 +588,14 @@ class Application:
             self.shell_window.refresh()
         self.draw_help_line()
         self.stdscr.noutrefresh()
-        # Set cursor position after all noutrefresh calls, right before doupdate
-        if self.active_window == "shell" and self.shell_window:
-            cursor_y, cursor_x = self.shell_window.get_cursor_position()
-            curses.setsyx(cursor_y, cursor_x)
+        # Hide cursor in commander mode; otherwise park it at the shell input
+        if self.shell_window and self.shell_window.is_cmdr_active:
+            curses.curs_set(0)
+        else:
+            curses.curs_set(1)
+            if self.active_window == "shell" and self.shell_window:
+                cursor_y, cursor_x = self.shell_window.get_cursor_position()
+                curses.setsyx(cursor_y, cursor_x)
         curses.doupdate()
 
     def run(self, stdscr: curses.window) -> None:
