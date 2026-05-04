@@ -22,9 +22,28 @@ class DeviceManager:
     def list_devices(self) -> list[AdbDevice]:
         """List all connected ADB devices."""
         try:
-            return self.client.device_list()
+            devices = self.client.device_list()
+            if devices:
+                return devices
         except Exception:
-            return []
+            pass
+        return self._list_devices_fallback()
+
+    def _list_devices_fallback(self) -> list[AdbDevice]:
+        """Parse `adb devices` output when adbutils returns nothing or fails."""
+        stdout, _ = self._run_adb_command(["devices"])
+        devices = []
+        for line in stdout.splitlines():
+            line = line.strip()
+            if not line or line.startswith("List of") or line.startswith("*"):
+                continue
+            parts = line.split()
+            if len(parts) >= 2 and parts[1] == "device":
+                try:
+                    devices.append(self.client.device(parts[0]))
+                except Exception:
+                    pass
+        return devices
 
     def connect(self, device: AdbDevice) -> bool:
         """Connect to a specific device."""
